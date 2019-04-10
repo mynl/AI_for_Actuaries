@@ -1,0 +1,236 @@
+---
+title: Practical AI
+---
+
+# Technology stack
+
+## OS
+
+* Any OS will do, I'm using Ubuntu
+
+## Hardware
+
+Graphics Processing Unit
+
+> "What happened is that the gaming market subsidized supercomputing for the next generation of artificial intelligence applications."
+
+- JJ Allaire and Francois XX
+
+## Backend
+
+* Tensorflow
+* Theano
+* CNTK
+
+## Frontend
+
+* R
+* Keras
+
+## Add it up
+
+> "[I]t’s a simple mechanism that, once scaled, ends up looking like magic."
+
+ - JJ Allaire and Francois XX
+ 
+# An example
+
+## 
+
+```{r}
+library(tidyverse)
+library(raw)
+
+tbl_wc <- raw::wkcomp
+
+tbl_wc <- tbl_wc %>% 
+  filter(Lag > 1) %>% 
+  group_by(
+    Company, AccidentYear
+  ) %>% 
+  mutate(
+      prior_cumulative_paid = dplyr::lag(CumulativePaid)
+    , incremental_paid = coalesce(
+          CumulativePaid - prior_cumulative_paid
+        , CumulativePaid
+      )
+    , upper = DevelopmentYear <= 1997
+    , lag_factor = as.factor(Lag)
+  ) %>% 
+  ungroup()
+
+tbl_upper <- tbl_wc %>% 
+  filter(upper)
+
+tbl_lower <- tbl_wc %>% 
+  filter(!upper)
+```
+
+## Fit a GLM
+
+```{r}
+fit_glm <- glm(
+    incremental_paid ~ NetEP:Lag
+  , data = tbl_upper
+  , family = poisson()
+)
+```
+
+## Pre-process
+
+```{r}
+tbl_upper_adj <- tbl_upper %>% 
+  mutate(
+    incremental_paid = pmax(0, incremental_paid)
+  )
+
+fit_glm <- glm(
+    incremental_paid ~ 0 + lag_factor + NetEP:lag_factor
+  , family = poisson()
+  , data = tbl_upper_adj
+)
+```
+
+## OOS Performance
+
+```{r }
+tbl_lower <- tbl_lower %>% 
+  mutate(
+      predict_glm = predict(fit_glm, type = 'response', newdata = .)
+    , residual_glm = incremental_paid - predict_glm
+  )
+```
+
+## AI
+
+* Set seed
+* Fit/train
+    * Batch size?
+* Visualize
+* Save
+
+## Seed
+
+```{r}
+library(keras)
+use_session_with_seed(1234)
+
+use_session_with_seed(1234, disable_gpu = FALSE, disable_parallel_cpu = FALSE)
+```
+
+## Pre-process
+
+```{r}
+mat_upper <- model.matrix(fit_glm)
+
+mat_lower <- model.matrix(
+    fit_glm
+  , data = tbl_lower
+)
+```
+
+## Pre-process 2
+
+```{r}
+dm_mean <- apply(mat_upper, 2, mean)
+dm_sd <- apply(mat_upper, 2, sd)
+
+mat_upper <- mat_upper %>% 
+  scale(center = dm_mean, scale = dm_sd)
+
+mat_lower <- mat_lower %>% 
+  scale(center = dm_mean, scale = dm_sd)
+```
+
+## Describe the layers
+
+```{r}
+fit_keras <- keras_model_sequential() 
+
+fit_keras %>% 
+  layer_dense(units = 32, activation = 'relu', input_shape = dim(mat_upper)[2]) %>% 
+  layer_dense(units = 32, activation = 'relu') %>%
+  layer_dense(units = 1)
+```
+
+## Compilation
+
+```{r}
+fit_keras %>% compile(
+    optimizer = "rmsprop",
+    loss = "mse",
+    metrics = c("mae")
+  )
+```
+
+## Fit
+
+```{r}
+keras_history <- fit_keras %>% 
+  fit(
+      mat_upper
+    , tbl_upper$incremental_paid
+    , epochs = 10
+    , batch_size = 1
+    , validation_split = 0.2
+)
+```
+
+## Predict
+
+```{r}
+# result <- fit_keras %>% 
+#   evaluate(mat_lower, tbl_lower$incremental_paid)
+# 
+# result
+
+tbl_lower <- tbl_lower %>% 
+  mutate(
+      predict_keras = predict(fit_keras, mat_lower)
+    , residual_keras = incremental_paid - predict_keras
+  )
+
+tbl_compare <- tbl_lower %>% 
+  group_by(AccidentYear) %>% 
+  summarise(
+      ibnr = sum(IBNR)
+    , ibnr_glm = sum(predict_glm)
+    , ibnr_keras = sum(predict_keras)
+    , rmse_glm = mean(residual_glm ^ 2) %>% sqrt()
+    , rmse_keras = mean(residual_keras ^ 2) %>% sqrt()
+  )
+```
+
+## 
+
+```{r}
+tbl_compare %>% 
+  summarise_at(vars(starts_with('ibnr')), sum)
+```
+
+##
+
+```{r}
+tbl_compare %>% 
+  select_at(vars(AccidentYear, starts_with('ibnr'))) %>% 
+  gather(model, ibnr, -AccidentYear) %>% 
+  ggplot(aes(AccidentYear, ibnr, color = model)) +
+  geom_point()
+```
+
+##
+
+```{r}
+tbl_lower %>% 
+  select_at(vars(starts_with('residual'))) %>% 
+  gather(model, residual) %>%
+  mutate(residual = abs(residual)) %>% 
+  ggplot(aes(residual, fill = model)) + 
+  geom_density() + 
+  scale_x_log10()
+```
+
+
+# References
+
+* Deep Learning with R - by Allaire and François Chollet
