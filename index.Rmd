@@ -44,7 +44,6 @@ library(raw)
 tbl_wc <- raw::wkcomp
 
 tbl_wc <- tbl_wc %>% 
-  filter(Lag > 1) %>% 
   group_by(
     Company, AccidentYear
   ) %>% 
@@ -55,9 +54,12 @@ tbl_wc <- tbl_wc %>%
         , CumulativePaid
       )
     , upper = DevelopmentYear <= 1997
-    , lag_factor = as.factor(Lag)
   ) %>% 
-  ungroup()
+  ungroup() %>% 
+  filter(Lag > 1) %>% 
+  mutate(
+    lag_factor = as.factor(Lag)
+  )
 
 tbl_upper <- tbl_wc %>% 
   filter(upper)
@@ -121,11 +123,19 @@ use_session_with_seed(1234, disable_gpu = FALSE, disable_parallel_cpu = FALSE)
 ## Pre-process
 
 ```{r}
+# Tempted to try this
 mat_upper <- model.matrix(fit_glm)
+#  incremental_paid ~ 0 + lag_factor + NetEP:lag_factor
 
+# But really only need to do this
 mat_lower <- model.matrix(
-    fit_glm
+    incremental_paid ~ 0 + lag_factor + NetEP
   , data = tbl_lower
+)
+
+mat_upper <- model.matrix(
+    incremental_paid ~ 0 + lag_factor + NetEP
+  , data = tbl_upper
 )
 ```
 
@@ -186,32 +196,42 @@ keras_history <- fit_keras %>%
 
 tbl_lower <- tbl_lower %>% 
   mutate(
-      predict_keras = predict(fit_keras, mat_lower)
+      predict_keras = predict(fit_keras, mat_lower) %>% as.numeric()
     , residual_keras = incremental_paid - predict_keras
   )
+```
 
-tbl_compare <- tbl_lower %>% 
-  group_by(AccidentYear) %>% 
-  summarise(
-      ibnr = sum(IBNR)
-    , ibnr_glm = sum(predict_glm)
-    , ibnr_keras = sum(predict_keras)
-    , rmse_glm = mean(residual_glm ^ 2) %>% sqrt()
-    , rmse_keras = mean(residual_keras ^ 2) %>% sqrt()
+## AY summary
+
+```{r }
+tbl_lower %>% 
+  select_at(
+    c(vars(starts_with('ibnr'))
+    , vars(starts_with('predict')))
   )
+
+tbl_ay <- tbl_lower %>% 
+  group_by(AccidentYear) %>% 
+  summarise_at(
+      c(vars(starts_with('ibnr'))
+    , vars(starts_with('predict')))
+    , sum  
+  )
+
+names(tbl_ay) <- gsub('predict', 'ibnr', names(tbl_ay))
 ```
 
 ## 
 
 ```{r}
-tbl_compare %>% 
+tbl_ay %>% 
   summarise_at(vars(starts_with('ibnr')), sum)
 ```
 
 ##
 
 ```{r}
-tbl_compare %>% 
+tbl_ay %>% 
   select_at(vars(AccidentYear, starts_with('ibnr'))) %>% 
   gather(model, ibnr, -AccidentYear) %>% 
   ggplot(aes(AccidentYear, ibnr, color = model)) +
@@ -227,6 +247,114 @@ tbl_lower %>%
   mutate(residual = abs(residual)) %>% 
   ggplot(aes(residual, fill = model)) + 
   geom_density() + 
+  scale_x_log10()
+```
+
+```{r}
+tbl_mojo <- tbl_lower %>% 
+  select(AccidentYear, DevelopmentYear, residual_glm, residual_keras)
+
+tbl_lower %>% 
+  ggplot(aes(as.factor(AccidentYear))) +
+  geom_boxplot(aes(y = residual_glm), color = 'red') +
+  geom_boxplot(aes(y = residual_keras), color = 'blue')
+```
+
+```{r}
+tbl_lower %>% 
+  ggplot(aes(predict_glm, residual_glm)) + 
+  geom_point() + 
+  scale_x_log10()
+
+tbl_lower %>% 
+  ggplot(aes(predict_keras, residual_keras)) + 
+  geom_point() + 
+  scale_x_log10()
+```
+
+## Synthesize company column
+
+```{r}
+tbl_company <- tbl_wc %>% 
+  filter(Lag == 2) %>% 
+  select(Company, NetEP) %>% 
+  group_by(Company) %>% 
+  summarise(sum_net_ep = sum(NetEP)) %>% 
+  mutate(
+    size_cat = cut_number(sum_net_ep, n = 5)
+  )
+
+tbl_upper <- tbl_upper %>% inner_join(tbl_company)
+tbl_lower <- tbl_lower %>% inner_join(tbl_company)
+```
+
+## And re-fit
+
+```{r}
+mat_lower <- model.matrix(
+    incremental_paid ~ 0 + lag_factor + size_cat + NetEP
+  , data = tbl_lower
+)
+
+mat_upper <- model.matrix(
+    incremental_paid ~ 0 + lag_factor + size_cat + NetEP
+  , data = tbl_upper
+)
+```
+
+## Pre-process 2
+
+```{r}
+dm_mean <- apply(mat_upper, 2, mean)
+dm_sd <- apply(mat_upper, 2, sd)
+
+mat_upper <- mat_upper %>% 
+  scale(center = dm_mean, scale = dm_sd)
+
+mat_lower <- mat_lower %>% 
+  scale(center = dm_mean, scale = dm_sd)
+```
+
+```{r}
+fit_keras <- keras_model_sequential() 
+
+fit_keras %>% 
+  layer_dense(units = 32, activation = 'relu', input_shape = dim(mat_upper)[2]) %>% 
+  layer_dense(units = 32, activation = 'relu') %>%
+  layer_dense(units = 1)
+
+fit_keras %>% compile(
+    optimizer = "rmsprop",
+    loss = "mse",
+    metrics = c("mae")
+  )
+
+keras_history <- fit_keras %>% 
+  fit(
+      mat_upper
+    , tbl_upper$incremental_paid
+    , epochs = 10
+    , batch_size = 1
+    , validation_split = 0.2
+)
+```
+
+## Predict
+
+```{r}
+tbl_lower <- tbl_lower %>% 
+  mutate(
+      predict_keras_size = predict(fit_keras, mat_lower) %>% as.numeric()
+    , residual_keras_size = incremental_paid - predict_keras_size
+  )
+```
+
+##
+
+```{r}
+tbl_lower %>% 
+  ggplot(aes(predict_keras_size, residual_keras_size)) + 
+  geom_point() + 
   scale_x_log10()
 ```
 
